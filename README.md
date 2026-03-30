@@ -65,10 +65,15 @@ No custom device tree overlay is needed. The Zephyr built-in shield
 ```bash
 cd ~/gh/nrf9161-epaper
 
+# Activate the venv first (required — system Python lacks pykwalify)
+export PATH="$HOME/ncs/.venv/bin:$PATH"
+export ZEPHYR_BASE="$HOME/ncs/zephyr"
+
 west build \
     -b nrf9161dk/nrf9161 \
     -p always \
-    -- -DSHIELD=waveshare_epaper_gdew075t7
+    -- -DSHIELD=waveshare_epaper_gdew075t7 \
+       -DPython3_EXECUTABLE="$HOME/ncs/.venv/bin/python3.12"
 ```
 
 | Flag | Purpose |
