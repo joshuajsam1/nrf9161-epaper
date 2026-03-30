@@ -7,125 +7,172 @@
  * Shield       : waveshare_epaper_gdew075t7
  *
  * Build:
+ *   export PATH="$HOME/ncs/.venv/bin:$PATH"
+ *   export ZEPHYR_BASE="$HOME/ncs/zephyr"
  *   west build -b nrf9161dk/nrf9161 -p always \
- *              -- -DSHIELD=waveshare_epaper_gdew075t7
+ *              -- -DSHIELD=waveshare_epaper_gdew075t7 \
+ *                 -DPython3_EXECUTABLE="$HOME/ncs/.venv/bin/python3.12"
  *
- * Flash:
- *   west flash
- *
- * Uses the Zephyr Character Framebuffer (CFB) API for text rendering.
- * No LVGL, no external graphics library.
+ * The UC8179 driver uses PIXEL_FORMAT_MONO10 with SCREEN_INFO_MONO_MSB_FIRST
+ * (horizontal row-major layout). Zephyr's CFB API only supports vertically-
+ * tiled displays (OLEDs), so we use display_write() directly and access
+ * Zephyr's built-in DroidSansMono 10x16 font data externally.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/display.h>
-#include <zephyr/display/cfb.h>
 #include <zephyr/logging/log.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(epaper_hello, LOG_LEVEL_INF);
+
+/* ---------- display geometry ---------- */
+#define DISPLAY_WIDTH   800
+#define DISPLAY_HEIGHT  480
+#define BYTES_PER_ROW   (DISPLAY_WIDTH / 8)
+#define FRAME_SIZE      (BYTES_PER_ROW * DISPLAY_HEIGHT)   /* 48 000 bytes */
+
+/* ---------- framebuffer ----------
+ * MONO10: 1 = white, 0 = black, bit 7 = leftmost pixel (MSB-first)
+ */
+static uint8_t framebuf[FRAME_SIZE];
+
+/* ---------- font ----------
+ * Zephyr's built-in DroidSansMono 10x16, compiled in by
+ * CONFIG_CHARACTER_FRAMEBUFFER + CONFIG_CHARACTER_FRAMEBUFFER_USE_DEFAULT_FONTS.
+ *
+ * Layout: cfb_font_1016[char_index][col * 2 + row / 8]
+ *   - char_index = ASCII code - 0x20  (0 = space, 1 = '!', ...)
+ *   - col = 0..9 (left to right)
+ *   - row = 0..15 (top to bottom)
+ *   - within each byte: bit (row % 8) is set when the pixel is foreground
+ */
+#define FONT_W   10
+#define FONT_H   16
+#define FONT_GAP  1     /* extra horizontal pixels between characters */
+
+extern const uint8_t cfb_font_1016[95][20];
+
+/* ---------- pixel helpers ---------- */
+
+static void fb_fill_white(void)
+{
+	memset(framebuf, 0xFF, FRAME_SIZE);  /* 0xFF = all white in MONO10 */
+}
+
+static inline void fb_set_black(int x, int y)
+{
+	if ((unsigned)x >= DISPLAY_WIDTH || (unsigned)y >= DISPLAY_HEIGHT) {
+		return;
+	}
+	/* clear bit → black pixel  (MSB-first: bit 7 = leftmost) */
+	framebuf[y * BYTES_PER_ROW + x / 8] &= ~(1u << (7 - x % 8));
+}
+
+/* ---------- font rendering ---------- */
+
+static void fb_draw_char(char c, int x, int y)
+{
+	int idx = (unsigned char)c - 0x20;
+
+	if (idx < 0 || idx >= 95) {
+		return;   /* unprintable — skip */
+	}
+	for (int col = 0; col < FONT_W; col++) {
+		for (int row = 0; row < FONT_H; row++) {
+			uint8_t byte = cfb_font_1016[idx][col * 2 + row / 8];
+			if ((byte >> (row % 8)) & 1u) {
+				fb_set_black(x + col, y + row);
+			}
+		}
+	}
+}
+
+static void fb_draw_string(const char *str, int x, int y)
+{
+	int cx = x;
+
+	while (*str) {
+		if (*str == '\n') {
+			cx = x;
+			y += FONT_H + 4;
+		} else {
+			fb_draw_char(*str, cx, y);
+			cx += FONT_W + FONT_GAP;
+		}
+		str++;
+	}
+}
+
+/* ---------- thick line for decorative border ---------- */
+static void fb_hline(int x0, int x1, int y, int thickness)
+{
+	for (int t = 0; t < thickness; t++) {
+		for (int x = x0; x <= x1; x++) {
+			fb_set_black(x, y + t);
+		}
+	}
+}
+
+static void fb_vline(int x, int y0, int y1, int thickness)
+{
+	for (int t = 0; t < thickness; t++) {
+		for (int y = y0; y <= y1; y++) {
+			fb_set_black(x + t, y);
+		}
+	}
+}
+
+/* ---------- main ---------- */
 
 int main(void)
 {
 	const struct device *display_dev;
-	uint8_t font_width, font_height;
 	int rc;
 
-	/* -----------------------------------------------------------------
-	 * 1. Obtain the display device.
-	 *    DT_CHOSEN(zephyr_display) resolves to the node set by:
-	 *      chosen { zephyr,display = &gdew075t7; }
-	 *    which the shield overlay writes automatically.
-	 * ----------------------------------------------------------------- */
+	/* 1. Get display device */
 	display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 	if (!device_is_ready(display_dev)) {
-		LOG_ERR("Display device '%s' not ready", display_dev->name);
+		LOG_ERR("Display not ready");
 		return -ENODEV;
 	}
-	LOG_INF("Display device ready: %s", display_dev->name);
+	LOG_INF("Display ready: %s", display_dev->name);
 
-	/* -----------------------------------------------------------------
-	 * 2. Disable blanking (activate the display).
-	 *    E-paper drivers return -ENOTSUP here — that is expected and safe.
-	 * ----------------------------------------------------------------- */
-	rc = display_blanking_off(display_dev);
-	if (rc != 0 && rc != -ENOTSUP) {
-		LOG_ERR("display_blanking_off failed: %d", rc);
-		return rc;
-	}
+	/* 2. White background */
+	fb_fill_white();
 
-	/* -----------------------------------------------------------------
-	 * 3. Initialise the Character Framebuffer.
-	 *    Allocates a RAM pixel buffer (k_malloc) sized to the full frame:
-	 *    800 * 480 / 8 = 48 000 bytes for 1bpp monochrome.
-	 *    CONFIG_HEAP_MEM_POOL_SIZE must be at least 56000.
-	 * ----------------------------------------------------------------- */
-	rc = cfb_framebuffer_init(display_dev);
+	/* 3. Border (4 px thick) */
+	fb_hline(0, DISPLAY_WIDTH - 1, 0,                   4);
+	fb_hline(0, DISPLAY_WIDTH - 1, DISPLAY_HEIGHT - 4,  4);
+	fb_vline(0,                  0, DISPLAY_HEIGHT - 1, 4);
+	fb_vline(DISPLAY_WIDTH - 4,  0, DISPLAY_HEIGHT - 1, 4);
+
+	/* 4. Text */
+	fb_draw_string("Hello, World!",            20, 20);
+	fb_draw_string("nRF9161 DK",               20, 60);
+	fb_draw_string("Waveshare 7.5\" 800x480",  20, 100);
+	fb_draw_string("e-Paper test OK",          20, 140);
+
+	/* 5. Send full frame to display (MONO10, 800x480) */
+	struct display_buffer_descriptor buf_desc = {
+		.buf_size = FRAME_SIZE,
+		.width    = DISPLAY_WIDTH,
+		.height   = DISPLAY_HEIGHT,
+		.pitch    = DISPLAY_WIDTH,
+	};
+
+	display_blanking_off(display_dev);  /* -ENOTSUP on e-paper is normal */
+
+	LOG_INF("Sending frame (%u bytes) — full refresh ~4 s...", FRAME_SIZE);
+	rc = display_write(display_dev, 0, 0, &buf_desc, framebuf);
 	if (rc != 0) {
-		LOG_ERR("cfb_framebuffer_init failed: %d  "
-			"(try increasing CONFIG_HEAP_MEM_POOL_SIZE)", rc);
-		return rc;
-	}
-	LOG_INF("CFB framebuffer initialised  (800 x 480, 1bpp)");
-
-	/* -----------------------------------------------------------------
-	 * 4. Clear the RAM framebuffer (does NOT send data to the panel yet).
-	 * ----------------------------------------------------------------- */
-	rc = cfb_framebuffer_clear(display_dev, false);
-	if (rc != 0) {
-		LOG_ERR("cfb_framebuffer_clear failed: %d", rc);
-		return rc;
-	}
-
-	/* -----------------------------------------------------------------
-	 * 5. Select a built-in font.
-	 *    Requires CONFIG_CHARACTER_FRAMEBUFFER_USE_DEFAULT_FONTS=y.
-	 *    Font index 0 is the smallest default font (~10x16 px).
-	 * ----------------------------------------------------------------- */
-	int num_fonts = cfb_get_numof_fonts(display_dev);
-	LOG_INF("Available CFB fonts: %d", num_fonts);
-
-	if (num_fonts > 0) {
-		cfb_framebuffer_set_font(display_dev, 0);
-		cfb_get_font_size(display_dev, 0, &font_width, &font_height);
-		LOG_INF("Using font 0: %u x %u px", font_width, font_height);
-	}
-
-	/* -----------------------------------------------------------------
-	 * 6. Draw text into the RAM framebuffer.
-	 *    cfb_draw_text(dev, string, x_pixels, y_pixels)
-	 *    Text is white-on-black by default on e-paper.
-	 * ----------------------------------------------------------------- */
-	rc = cfb_draw_text(display_dev, "Hello, World!", 10, 10);
-	if (rc != 0) {
-		LOG_ERR("cfb_draw_text failed: %d", rc);
-	}
-
-	rc = cfb_draw_text(display_dev, "nRF9161 DK", 10, 40);
-	if (rc != 0) {
-		LOG_WRN("cfb_draw_text line 2 failed: %d", rc);
-	}
-
-	rc = cfb_draw_text(display_dev, "Waveshare 7.5\" 800x480", 10, 70);
-	if (rc != 0) {
-		LOG_WRN("cfb_draw_text line 3 failed: %d", rc);
-	}
-
-	/* -----------------------------------------------------------------
-	 * 7. Flush the RAM framebuffer to the panel and trigger refresh.
-	 *    On 7.5" e-paper this full refresh takes ~3-4 seconds.
-	 *    The BUSY GPIO is polled inside the UC8179 driver — you do not
-	 *    need to poll it yourself.
-	 * ----------------------------------------------------------------- */
-	LOG_INF("Sending framebuffer to display (full refresh ~4s) ...");
-	rc = cfb_framebuffer_finalize(display_dev);
-	if (rc != 0) {
-		LOG_ERR("cfb_framebuffer_finalize failed: %d", rc);
+		LOG_ERR("display_write failed: %d", rc);
 		return rc;
 	}
 	LOG_INF("Display refresh complete");
 
-	/* E-paper retains the image with no power — sleep forever. */
+	/* E-paper holds image without power — sleep forever */
 	while (1) {
 		k_sleep(K_FOREVER);
 	}
