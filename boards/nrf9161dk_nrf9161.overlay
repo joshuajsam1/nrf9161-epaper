@@ -1,0 +1,15 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Fix for GDEW075T7 (UC8179): the Zephyr upstream shield overlay marks
+ * busy-gpios as GPIO_ACTIVE_LOW, but the UC8179 outputs HIGH when busy
+ * (confirmed by Waveshare demo code: "while(busy_pin == 1) wait").
+ * With ACTIVE_LOW the driver reads HIGH as "not busy" and never waits,
+ * sending SPI commands before the display is ready → blank output.
+ *
+ * This overlay overrides busy-gpios to GPIO_ACTIVE_HIGH so the driver
+ * correctly waits while the pin is HIGH (busy).
+ */
+&uc8179_waveshare_epaper_gdew075t7 {
+	busy-gpios = <&arduino_header 13 GPIO_ACTIVE_HIGH>; /* D7 */
+};

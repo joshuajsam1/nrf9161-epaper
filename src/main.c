@@ -162,14 +162,23 @@ int main(void)
 		.pitch    = DISPLAY_WIDTH,
 	};
 
-	display_blanking_off(display_dev);  /* -ENOTSUP on e-paper is normal */
+	/* Trigger the first refresh (clears to white) then enable writes to DTM2 */
+	LOG_INF("Blanking off (first refresh, clears display)...");
+	display_blanking_off(display_dev);
 
-	LOG_INF("Sending frame (%u bytes) — full refresh ~4 s...", FRAME_SIZE);
+	/* Belt-and-suspenders: sleep long enough for a full UC8179 refresh
+	 * (~4 s) in case the BUSY GPIO polarity is still off. */
+	k_sleep(K_SECONDS(5));
+	LOG_INF("Sending frame (%u bytes)...", FRAME_SIZE);
+
 	rc = display_write(display_dev, 0, 0, &buf_desc, framebuf);
 	if (rc != 0) {
 		LOG_ERR("display_write failed: %d", rc);
 		return rc;
 	}
+
+	/* Wait for the second full refresh to physically complete */
+	k_sleep(K_SECONDS(5));
 	LOG_INF("Display refresh complete");
 
 	/* E-paper holds image without power — sleep forever */
