@@ -13,6 +13,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include <modem/sms.h>
 #include <modem/nrf_modem_lib.h>
@@ -35,6 +36,12 @@ LOG_MODULE_REGISTER(sms_display, LOG_LEVEL_INF);
 #define CHARS_PER_LINE ((DISPLAY_WIDTH - 40) / (FONT_W + 1)) /* ~68 chars */
 
 extern const uint8_t cfb_font_1016[95][20];
+
+/* ---- heartbeat LED (LED1 on nRF9161 DK) ---------------------------------- */
+static const struct gpio_dt_spec hb_led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+
+static void hb_timer_fn(struct k_timer *t) { gpio_pin_toggle_dt(&hb_led); }
+K_TIMER_DEFINE(hb_timer, hb_timer_fn, NULL);
 
 /* ---- display state ------------------------------------------------------- */
 static const struct device *display_dev;
@@ -291,6 +298,13 @@ int main(void)
 	int rc;
 
 	LOG_INF("=== nRF9161 SMS Display starting ===");
+
+	/* ---- Heartbeat LED ------------------------------------------------ */
+	if (gpio_is_ready_dt(&hb_led)) {
+		gpio_pin_configure_dt(&hb_led, GPIO_OUTPUT_ACTIVE);
+		k_timer_start(&hb_timer, K_SECONDS(3), K_SECONDS(3));
+		LOG_INF("Heartbeat LED started (LED1, 3s toggle)");
+	}
 
 	/* ---- Step 1: Init display ---------------------------------------- */
 	display_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
