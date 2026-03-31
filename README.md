@@ -1,9 +1,13 @@
-# nRF9161 DK + Waveshare 7.5" e-Paper Test
+# nRF9161 DK — e-Paper SMS Display
 
-A minimal [nRF Connect SDK](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/) (Zephyr RTOS) application that prints text to a Waveshare 7.5" 800×480 e-ink display connected to an nRF9161 Development Kit.
+An [nRF Connect SDK](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/) (Zephyr RTOS) application that:
+
+1. Displays a high-contrast test pattern on a Waveshare 7.5" 800×480 e-ink display.
+2. Connects to the LTE network via the nRF9161 modem.
+3. Listens for incoming SMS messages and renders each message on the e-ink display.
 
 **Hardware:**
-- [nRF9161 DK](https://www.nordicsemi.com/Products/Development-hardware/nRF9161-DK)
+- [nRF9161 DK](https://www.nordicsemi.com/Products/Development-hardware/nRF9161-DK) with nano SIM card inserted
 - [Waveshare Universal e-Paper Driver HAT (SKU 13512)](https://www.waveshare.com/e-paper-driver-hat.htm)
 - [Waveshare 7.5" e-Paper Display (GDEW075T7, 800×480)](https://www.waveshare.com/7.5inch-e-paper-hat.htm)
 
@@ -11,7 +15,7 @@ A minimal [nRF Connect SDK](https://developer.nordicsemi.com/nRF_Connect_SDK/doc
 
 ## Hardware Wiring
 
-Connect the Waveshare HAT ribbon cable to the nRF9161 DK Arduino header using jumper wires:
+Connect the Waveshare HAT ribbon cable to the nRF9161 DK Arduino header:
 
 | HAT Pin | Signal | nRF9161 DK Arduino Pin | nRF GPIO | Notes |
 |---------|--------|------------------------|----------|-------|
@@ -22,17 +26,21 @@ Connect the Waveshare HAT ribbon cable to the nRF9161 DK Arduino header using ju
 | 5 | CS | D10 | P0.10 | SPI3 chip select (active low) |
 | 6 | DC | D9 | P0.09 | Data / Command select |
 | 7 | RST | D8 | P0.08 | Reset (active low) |
-| 8 | BUSY | D7 | P0.07 | Busy flag (driver polls this) |
+| 8 | BUSY | D7 | P0.07 | Busy flag (HIGH = busy) |
+
+> Use **3.3V only**. The nRF9161 DK exposes 3.3V on the Arduino header VCC pin. Do not connect to 5V.
 
 > MISO (D12) is part of the SPI3 pinctrl but unused by e-paper — leave it unconnected.
 
-The HAT's 40-pin Raspberry Pi header is not used; connect via the ribbon cable connector only.
+### SIM Card
+
+Insert a nano SIM card into the J3 slot on the nRF9161 DK. The SIM must support SMS. The phone number printed on the SIM (or shown by your carrier) is the number to SMS to trigger the display.
 
 ---
 
 ## Prerequisites
 
-1. **nRF Connect SDK** v2.7.0 or later installed.
+1. **nRF Connect SDK** v2.7.0 or later (tested with v2.9.0).
    Follow the [official getting started guide](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/getting_started.html) or use the **nRF Connect for VS Code** extension.
 
 2. **west** workspace initialised and dependencies fetched:
@@ -48,15 +56,16 @@ The HAT's 40-pin Raspberry Pi header is not used; connect via the ribbon cable c
 
 ```
 nrf9161-epaper/
-├── CMakeLists.txt       # Build definition
-├── prj.conf             # Zephyr Kconfig options
+├── CMakeLists.txt                    # Build definition
+├── prj.conf                          # Zephyr Kconfig options
+├── boards/
+│   ├── nrf9161dk_nrf9161.overlay     # BUSY GPIO polarity fix (non-NS)
+│   └── nrf9161dk_nrf9161_ns.overlay  # BUSY GPIO polarity fix (NS/TF-M)
 └── src/
-    └── main.c           # Application — init display, print text
+    └── main.c                        # SMS display application
 ```
 
-No custom device tree overlay is needed. The Zephyr built-in shield
-`waveshare_epaper_gdew075t7` provides the full device tree configuration
-(SPI node, GPIO pin assignments, UC8179 driver binding).
+The Zephyr built-in shield `waveshare_epaper_gdew075t7` provides the display device tree configuration. The board overlay overrides the `busy-gpios` polarity to `GPIO_ACTIVE_HIGH` to match the UC8179 controller's actual behaviour (HIGH = busy, confirmed by Waveshare demo code).
 
 ---
 
@@ -65,12 +74,12 @@ No custom device tree overlay is needed. The Zephyr built-in shield
 ```bash
 cd ~/gh/nrf9161-epaper
 
-# Activate the venv first (required — system Python lacks pykwalify)
+# Activate the ncs venv (required — system Python lacks pykwalify)
 export PATH="$HOME/ncs/.venv/bin:$PATH"
 export ZEPHYR_BASE="$HOME/ncs/zephyr"
 
 west build \
-    -b nrf9161dk/nrf9161 \
+    -b nrf9161dk/nrf9161/ns \
     -p always \
     -- -DSHIELD=waveshare_epaper_gdew075t7 \
        -DPython3_EXECUTABLE="$HOME/ncs/.venv/bin/python3.12"
@@ -78,8 +87,8 @@ west build \
 
 | Flag | Purpose |
 |------|---------|
-| `-b nrf9161dk/nrf9161` | Target board (nRF9161 DK, nRF9161 core) |
-| `-p always` | Pristine/clean build (recommended when changing shields) |
+| `-b nrf9161dk/nrf9161/ns` | Non-secure (TF-M) target — required for modem/SMS access |
+| `-p always` | Pristine/clean build |
 | `-DSHIELD=waveshare_epaper_gdew075t7` | Apply the upstream Waveshare 7.5" shield overlay |
 
 ---
@@ -87,71 +96,86 @@ west build \
 ## Flash
 
 ```bash
-west flash
+west flash --runner jlink
 ```
 
-Or specify the J-Link runner explicitly:
+Or via nrfjprog directly:
 
 ```bash
-west flash --runner jlink
+nrfjprog --program build/merged.hex --sectorerase --verify --reset
 ```
 
 ---
 
 ## Serial Monitor
 
-Open the USB serial port at **115200 baud** to see log output:
+Open the USB serial port at **115200 baud**:
 
 ```bash
-# macOS
-screen /dev/tty.usbmodem* 115200
-
-# Linux
-screen /dev/ttyACM0 115200
-
-# Or use minicom
-minicom -D /dev/ttyACM0 -b 115200
+# macOS — use cu. device (tty. blocks on macOS)
+screen /dev/cu.usbmodem* 115200
 ```
 
-### Expected output
+### Expected boot sequence
 
 ```
-[00:00:00.200] <inf> epaper_hello: Display device ready: uc8179@0
-[00:00:00.201] <inf> epaper_hello: CFB framebuffer initialised  (800 x 480, 1bpp)
-[00:00:00.202] <inf> epaper_hello: Available CFB fonts: 1
-[00:00:00.203] <inf> epaper_hello: Using font 0: 10 x 16 px
-[00:00:00.204] <inf> epaper_hello: Sending framebuffer to display (full refresh ~4s) ...
-[00:00:04.300] <inf> epaper_hello: Display refresh complete
+[00:00:00.xxx] <inf> sms_display: === nRF9161 SMS Display starting ===
+[00:00:00.xxx] <inf> sms_display: Display ready: uc8179@0
+[00:00:08.xxx] <inf> sms_display: Display initialised
+[00:00:16.xxx] <inf> sms_display: Modem library initialised
+[00:00:16.xxx] <inf> sms_display: Connecting to LTE...
+... (30-120 seconds for LTE registration) ...
+[00:01:xx.xxx] <inf> sms_display: Connected to LTE
+[00:01:xx.xxx] <inf> sms_display: SMS listener registered (handle 0)
+[00:01:xx.xxx] <inf> sms_display: === Waiting for SMS messages ===
 ```
 
-The display will show three lines of text after a ~4 second full refresh cycle and then retain the image indefinitely with no power.
+After the "Waiting for SMS messages" log the display shows:
+
+```
+Ready! Send an SMS to this
+device to display it here.
+```
+
+### Sending a test SMS
+
+Send an SMS from your phone to the SIM card's number. After a few seconds the display will refresh (~5-8 s for e-ink waveform) and show:
+
+```
+SMS RECEIVED (white text on black header)
+From: +1234567890
+Your message text here, automatically
+word-wrapped across multiple lines.
+─────────────────────────
+nRF9161 DK | UC8179 | 800x480
+```
 
 ---
 
 ## How It Works
 
-1. **Device acquisition** — `DEVICE_DT_GET(DT_CHOSEN(zephyr_display))` resolves the display node set in the shield overlay's `chosen` block.
-2. **CFB init** — `cfb_framebuffer_init()` allocates a 48 000-byte RAM pixel buffer (800×480 ÷ 8 bits).
-3. **Draw** — `cfb_draw_text()` renders text into the RAM buffer at pixel coordinates.
-4. **Flush** — `cfb_framebuffer_finalize()` sends the buffer over SPI to the UC8179 controller and triggers the e-paper waveform refresh. The BUSY GPIO is polled inside the driver.
+1. **Display init** — `DEVICE_DT_GET(DT_CHOSEN(zephyr_display))` acquires the UC8179 display. `display_blanking_off()` triggers the initial clear refresh (all-white). The board overlay fixes the BUSY GPIO polarity (`GPIO_ACTIVE_HIGH`) so the driver correctly waits during the ~5 s refresh waveform.
+
+2. **Modem init** — `nrf_modem_lib_init()` initialises the nRF9161 baseband modem over the IPC shared-memory interface.
+
+3. **LTE connect** — `lte_lc_register_handler()` + `lte_lc_connect()` (blocking) register an event handler and wait for LTE registration. This typically takes 30–120 seconds depending on signal strength.
+
+4. **SMS listener** — `sms_register_listener()` registers a callback that fires whenever an SMS is received. The callback copies the sender address and text into a message queue.
+
+5. **Display thread** — A dedicated thread (`disp_worker`) dequeues SMS messages and renders them: inverted header bar with sender number, word-wrapped body text, and a footer rule.
 
 ---
 
 ## Adapting for a Different Panel
 
-Change only the `-DSHIELD` flag. No code changes are needed:
+Change the `-DSHIELD` flag and update `CONFIG_HEAP_MEM_POOL_SIZE` in `prj.conf` (minimum = `width × height / 8` bytes):
 
-| Panel | Controller | Shield Flag |
-|-------|-----------|-------------|
-| 7.5" GDEW075T7 (800×480) | UC8179 | `waveshare_epaper_gdew075t7` ← **this project** |
-| 2.13" GDEH0213B1 (250×122) | SSD1673 | `waveshare_epaper_gdeh0213b1` |
-| 2.13" GDEY0213B74 (250×122) | SSD1680 | `waveshare_epaper_gdey0213b74` |
-| 2.9" GDEH029A1 (296×128) | SSD1608 | `waveshare_epaper_gdeh029a1` |
-| 1.54" GDEH0154A07 (200×200) | SSD1681 | `waveshare_epaper_gdeh0154a07` |
-| 4.2" GDEW042T2 (400×300) | UC8176 | `waveshare_epaper_gdew042t2` |
-
-For smaller panels also reduce `CONFIG_HEAP_MEM_POOL_SIZE` in `prj.conf`
-(minimum = `width × height / 8` bytes, e.g. 4096 for 2.13").
+| Panel | Controller | Shield Flag | Heap (bytes) |
+|-------|-----------|-------------|--------------|
+| 7.5" GDEW075T7 (800×480) | UC8179 | `waveshare_epaper_gdew075t7` ← **this project** | 65000 |
+| 4.2" GDEW042T2 (400×300) | UC8176 | `waveshare_epaper_gdew042t2` | 20000 |
+| 2.9" GDEH029A1 (296×128) | SSD1608 | `waveshare_epaper_gdeh029a1` | 8000 |
+| 2.13" GDEY0213B74 (250×122) | SSD1680 | `waveshare_epaper_gdey0213b74` | 6000 |
 
 ---
 
@@ -159,8 +183,11 @@ For smaller panels also reduce `CONFIG_HEAP_MEM_POOL_SIZE` in `prj.conf`
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `Display device not ready` | Shield not applied or wrong shield name | Verify `-DSHIELD=waveshare_epaper_gdew075t7` in build command |
-| `cfb_framebuffer_init failed: -12` (-ENOMEM) | Heap too small | Increase `CONFIG_HEAP_MEM_POOL_SIZE` in `prj.conf` |
-| Display stays blank after refresh | BUSY pin not wired to D7 | Driver polls BUSY during init; floating BUSY causes timeout |
-| Garbled / shifted output | DC and RST wires swapped | Verify D9=DC, D8=RST per wiring table |
-| Build error: SPI node not found | Outdated nRF Connect SDK | Use nRF Connect SDK v2.7.0 or later |
+| `Display not ready` | Shield not applied or wrong name | Verify `-DSHIELD=waveshare_epaper_gdew075t7` |
+| Display stays blank after ~30 s | BUSY GPIO polarity wrong | Confirm `boards/*.overlay` sets `GPIO_ACTIVE_HIGH` |
+| Display blanks in ~200 ms (too fast) | BUSY polarity inverted — driver not waiting | Set `GPIO_ACTIVE_HIGH` in overlay |
+| LTE connect times out | No SIM, no signal, or wrong APN | Check SIM is inserted and has LTE coverage |
+| SMS listener returns -EBUSY | Modem not connected yet | Wait for LTE connection before registering SMS |
+| Build error: `nrf_modem.h` not found | Building for non-NS target | Use `-b nrf9161dk/nrf9161/ns` (not `/nrf9161`) |
+| Build error: `cfb_font_1016` undefined | CHARACTER_FRAMEBUFFER not enabled | Add `CONFIG_CHARACTER_FRAMEBUFFER=y` in `prj.conf` |
+| J-Link "Cannot connect" after flash | J-Link USB out of sync | Unplug/replug USB cable to the nRF9161 DK |
